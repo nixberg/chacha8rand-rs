@@ -13,6 +13,11 @@ pub struct ChaCha8Rand {
 }
 
 impl ChaCha8Rand {
+    #[inline]
+    fn block(&mut self) {
+        chacha8::block(&mut self.buffer, &self.seed, self.counter);
+    }
+
     fn from_seed_counter_index(seed: [u8; 32], counter: u32, index: usize) -> Self {
         let end_index = if counter == 12 { 28 } else { 32 };
         debug_assert!((0..=12).contains(&counter));
@@ -41,32 +46,6 @@ impl ChaCha8Rand {
         generator
     }
 
-    pub fn unmarshal(bytes: [u8; 48]) -> Option<Self> {
-        if bytes.len() != 48 || bytes[0..8] != *b"chacha8:" {
-            return None;
-        }
-
-        let used = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let counter = 4 * (used as u32 / 32);
-        let index = used as usize % 32;
-
-        let end_index = if counter == 12 { 28 } else { 32 };
-        if !(0..=12).contains(&counter) || counter % 4 != 0 || !(0..=end_index).contains(&index) {
-            return None;
-        }
-
-        Some(Self::from_seed_counter_index(
-            bytes[16..48].try_into().unwrap(),
-            counter,
-            index,
-        ))
-    }
-
-    #[inline]
-    fn block(&mut self) {
-        chacha8::block(&mut self.buffer, &self.seed, self.counter);
-    }
-
     fn refill(&mut self) {
         self.counter += 4;
 
@@ -88,19 +67,42 @@ impl ChaCha8Rand {
         self.end_index = if self.counter == 12 { 28 } else { 32 };
     }
 
-    pub fn marshal(&self) -> [u8; 48] {
-        let mut result = [0u8; 48];
-
-        result[00..08].copy_from_slice(b"chacha8:");
-
-        let used = (self.counter / 4) as u64 * 32 + self.index as u64;
-        result[08..16].copy_from_slice(&used.to_be_bytes());
-
-        for (chunk, word) in result[16..48].chunks_mut(4).zip(self.seed) {
-            chunk.copy_from_slice(&word.to_le_bytes());
+    pub fn decode(bytes: [u8; 48]) -> Option<Self> {
+        if bytes[0..8] != *b"chacha8:" {
+            return None;
         }
 
-        result
+        let used = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let counter = 4 * (used as u32 / 32);
+        let index = used as usize % 32;
+
+        let end_index = if counter == 12 { 28 } else { 32 };
+        if !(0..=12).contains(&counter) || counter % 4 != 0 || !(0..=end_index).contains(&index) {
+            return None;
+        }
+
+        Some(Self::from_seed_counter_index(
+            bytes[16..48].try_into().unwrap(),
+            counter,
+            index,
+        ))
+    }
+
+    pub fn encode(&self) -> [u8; 48] {
+        let mut bytes = [0u8; 48];
+        self.encode_into(&mut bytes);
+        bytes
+    }
+
+    pub fn encode_into(&self, bytes: &mut [u8; 48]) {
+        bytes[00..08].copy_from_slice(b"chacha8:");
+
+        let used = (self.counter / 4) as u64 * 32 + self.index as u64;
+        bytes[08..16].copy_from_slice(&used.to_be_bytes());
+
+        for (chunk, word) in bytes[16..48].chunks_mut(4).zip(self.seed) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
     }
 }
 
@@ -113,6 +115,10 @@ impl SeedableRng for ChaCha8Rand {
 }
 
 impl RngCore for ChaCha8Rand {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        impls::fill_bytes_via_next(self, dest)
+    }
+
     fn next_u32(&mut self) -> u32 {
         self.next_u64() as u32
     }
@@ -130,10 +136,6 @@ impl RngCore for ChaCha8Rand {
         let result = self.buffer[self.index];
         self.index += 1;
         result
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        impls::fill_bytes_via_next(self, dest)
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
@@ -154,28 +156,27 @@ mod tests {
     }
 
     #[test]
-    fn marshal() {
-        assert_eq!(ChaCha8Rand::from_seed(SEED).marshal(), MARSHALLED);
-    }
-
-    #[test]
-    fn unmarshal() {
-        let mut generator = ChaCha8Rand::unmarshal(MARSHALLED).unwrap();
+    fn decode() {
+        let mut generator = ChaCha8Rand::decode(ENCODED_BYTES).unwrap();
         for expected_value in EXPECTED_OUTPUT {
             assert_eq!(generator.next_u64(), expected_value);
         }
     }
 
     #[test]
+    fn encode() {
+        assert_eq!(ChaCha8Rand::from_seed(SEED).encode(), ENCODED_BYTES);
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore)] // Too slow.
-    fn marshal_roundtrip() {
+    fn roundtrip() {
         for i in 0..=EXPECTED_OUTPUT.len() {
-            println!("{}", i);
             let mut generator = ChaCha8Rand::from_seed(SEED);
             for &expected_value in EXPECTED_OUTPUT[..i].into_iter() {
                 assert_eq!(generator.next_u64(), expected_value);
             }
-            generator = ChaCha8Rand::unmarshal(generator.marshal()).unwrap();
+            generator = ChaCha8Rand::decode(generator.encode()).unwrap();
             for &expected_value in EXPECTED_OUTPUT[i..].into_iter() {
                 assert_eq!(generator.next_u64(), expected_value);
             }
@@ -184,7 +185,7 @@ mod tests {
 
     const SEED: [u8; 32] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
 
-    const MARSHALLED: [u8; 48] = [
+    const ENCODED_BYTES: [u8; 48] = [
         0x63, 0x68, 0x61, 0x63, 0x68, 0x61, 0x38, 0x3a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
         0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x31, 0x32, 0x33,
