@@ -1,0 +1,11 @@
+[package]
+authors     = ["nixberg"]
+description = "ChaCha8Rand is a ChaCha8-based key-erasure CSPRNG"
+edition     = "2021"
+license     = "MIT"
+name        = "chacha8rand"
+repository  = "https://github.com/nixberg/chacha8rand-rs"
+version     = "0.1.0"
+
+[dependencies]
+rand_core = "0.6"
