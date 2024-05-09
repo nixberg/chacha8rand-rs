@@ -1,6 +1,6 @@
 [package]
 authors     = ["nixberg"]
-description = "ChaCha8Rand is a ChaCha8-based key-erasure CSPRNG"
+description = "ChaCha8Rand is a fast ChaCha8-based key-erasure CSPRNG"
 edition     = "2021"
 license     = "MIT"
 name        = "chacha8rand"
