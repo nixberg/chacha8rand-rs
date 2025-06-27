@@ -1,31 +1,89 @@
 #![feature(portable_simd)]
+#![feature(slice_as_chunks)]
 
-mod chacha8;
+mod chacha8_04;
+mod chacha8_08;
+mod chacha8_16;
 
-use rand_core::{impls, Error, RngCore, SeedableRng};
+use rand_core::{impls, RngCore, SeedableRng};
 
-pub struct ChaCha8Rand {
-    buffer: [u64; 32],
-    seed: [u32; 8],
-    counter: u32,
-    index: usize,
-    end_index: usize,
+pub trait BinaryCodable<const BYTE_COUNT: usize>
+where
+    Self: Sized,
+{
+    fn decode(bytes: &[u8; BYTE_COUNT]) -> Option<Self>;
+
+    fn encode_into(&self, bytes: &mut [u8; BYTE_COUNT]);
+
+    fn encode(&self) -> [u8; BYTE_COUNT] {
+        let mut bytes = [0u8; BYTE_COUNT];
+        self.encode_into(&mut bytes);
+        bytes
+    }
 }
 
-impl ChaCha8Rand {
-    #[inline]
-    fn block(&mut self) {
-        chacha8::block(&mut self.buffer, &self.seed, self.counter);
-    }
+macro_rules! generate_chacha8rand_impl {
+    ($name:ident, $parallelism:literal) => {
+        pub struct $name(ChaCha8RandImplementation<$parallelism>);
 
-    fn from_seed_counter_index(seed: [u8; 32], counter: u32, index: usize) -> Self {
-        let end_index = if counter == 12 { 28 } else { 32 };
-        debug_assert!((0..=12).contains(&counter));
-        debug_assert!(counter % 4 == 0);
-        debug_assert!((0..=end_index).contains(&index));
+        impl BinaryCodable<48> for $name {
+            fn decode(bytes: &[u8; 48]) -> Option<Self> {
+                if let Some(core) = ChaCha8RandImplementation::decode(bytes) {
+                    Some(Self(core))
+                } else {
+                    None
+                }
+            }
+
+            fn encode_into(&self, bytes: &mut [u8; 48]) {
+                self.0.encode_into(bytes)
+            }
+        }
+
+        impl RngCore for $name {
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                self.0.fill_bytes(dest);
+            }
+
+            fn next_u32(&mut self) -> u32 {
+                self.0.next_u32()
+            }
+
+            fn next_u64(&mut self) -> u64 {
+                self.0.next_u64()
+            }
+        }
+
+        impl SeedableRng for $name {
+            type Seed = [u8; 32];
+
+            fn from_seed(seed: [u8; 32]) -> Self {
+                Self(ChaCha8RandImplementation::from_seed(seed))
+            }
+        }
+    };
+}
+
+generate_chacha8rand_impl!(ChaCha8Rand04, 04);
+generate_chacha8rand_impl!(ChaCha8Rand08, 08);
+generate_chacha8rand_impl!(ChaCha8Rand16, 16);
+
+pub type ChaCha8Rand = ChaCha8Rand04;
+
+struct ChaCha8RandImplementation<const PARALLELISM: usize> {
+    buffer: [u64; 128],
+    seed: [u32; 8],
+    index: usize,
+}
+
+impl<const PARALLELISM: usize> ChaCha8RandImplementation<PARALLELISM> {
+    fn from_seed_index(seed: &[u8; 32], index: usize) -> Option<Self> {
+        if !(0..=124).contains(&index) {
+            return None;
+        }
 
         let mut generator = Self {
-            buffer: [0; 32],
+            buffer: [0; 128],
             seed: [
                 u32::from_le_bytes(seed[00..04].try_into().unwrap()),
                 u32::from_le_bytes(seed[04..08].try_into().unwrap()),
@@ -36,69 +94,54 @@ impl ChaCha8Rand {
                 u32::from_le_bytes(seed[24..28].try_into().unwrap()),
                 u32::from_le_bytes(seed[28..32].try_into().unwrap()),
             ],
-            counter: counter,
             index: index,
-            end_index: end_index,
         };
 
-        generator.block();
+        generator.expand_seed();
 
-        generator
+        Some(generator)
+    }
+
+    fn expand_seed(&mut self) {
+        match PARALLELISM {
+            04 => chacha8_04::expand(&self.seed, &mut self.buffer),
+            08 => chacha8_08::expand(&self.seed, &mut self.buffer),
+            16 => chacha8_16::expand(&self.seed, &mut self.buffer),
+            _ => panic!("Invalid degree of parallelism!"),
+        };
     }
 
     fn refill(&mut self) {
-        self.counter += 4;
+        self.seed[0] = (self.buffer[124] >> 00) as u32;
+        self.seed[1] = (self.buffer[124] >> 32) as u32;
+        self.seed[2] = (self.buffer[125] >> 00) as u32;
+        self.seed[3] = (self.buffer[125] >> 32) as u32;
+        self.seed[4] = (self.buffer[126] >> 00) as u32;
+        self.seed[5] = (self.buffer[126] >> 32) as u32;
+        self.seed[6] = (self.buffer[127] >> 00) as u32;
+        self.seed[7] = (self.buffer[127] >> 32) as u32;
 
-        if self.counter == 16 {
-            self.seed[0] = (self.buffer[28] >> 00) as u32;
-            self.seed[1] = (self.buffer[28] >> 32) as u32;
-            self.seed[2] = (self.buffer[29] >> 00) as u32;
-            self.seed[3] = (self.buffer[29] >> 32) as u32;
-            self.seed[4] = (self.buffer[30] >> 00) as u32;
-            self.seed[5] = (self.buffer[30] >> 32) as u32;
-            self.seed[6] = (self.buffer[31] >> 00) as u32;
-            self.seed[7] = (self.buffer[31] >> 32) as u32;
-            self.counter = 0;
-        }
-
-        self.block();
+        self.expand_seed();
 
         self.index = 0;
-        self.end_index = if self.counter == 12 { 28 } else { 32 };
     }
+}
 
-    pub fn decode(bytes: [u8; 48]) -> Option<Self> {
+impl<const PARALLELISM: usize> BinaryCodable<48> for ChaCha8RandImplementation<PARALLELISM> {
+    fn decode(bytes: &[u8; 48]) -> Option<Self> {
         if bytes[0..8] != *b"chacha8:" {
             return None;
         }
 
-        let used = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let counter = 4 * (used as u32 / 32);
-        let index = used as usize % 32;
+        let index = usize::try_from(u64::from_be_bytes(bytes[8..16].try_into().unwrap())).ok()?;
 
-        let end_index = if counter == 12 { 28 } else { 32 };
-        if !(0..=12).contains(&counter) || counter % 4 != 0 || !(0..=end_index).contains(&index) {
-            return None;
-        }
-
-        Some(Self::from_seed_counter_index(
-            bytes[16..48].try_into().unwrap(),
-            counter,
-            index,
-        ))
+        Self::from_seed_index(bytes[16..48].try_into().unwrap(), index)
     }
 
-    pub fn encode(&self) -> [u8; 48] {
-        let mut bytes = [0u8; 48];
-        self.encode_into(&mut bytes);
-        bytes
-    }
-
-    pub fn encode_into(&self, bytes: &mut [u8; 48]) {
+    fn encode_into(&self, bytes: &mut [u8; 48]) {
         bytes[00..08].copy_from_slice(b"chacha8:");
 
-        let used = (self.counter / 4) as u64 * 32 + self.index as u64;
-        bytes[08..16].copy_from_slice(&used.to_be_bytes());
+        bytes[08..16].copy_from_slice(&(self.index as u64).to_be_bytes());
 
         for (chunk, word) in bytes[16..48].chunks_mut(4).zip(self.seed) {
             chunk.copy_from_slice(&word.to_le_bytes());
@@ -106,15 +149,15 @@ impl ChaCha8Rand {
     }
 }
 
-impl SeedableRng for ChaCha8Rand {
+impl<const PARALLELISM: usize> SeedableRng for ChaCha8RandImplementation<PARALLELISM> {
     type Seed = [u8; 32];
 
     fn from_seed(seed: [u8; 32]) -> Self {
-        Self::from_seed_counter_index(seed, 0, 0)
+        Self::from_seed_index(&seed, 0).unwrap()
     }
 }
 
-impl RngCore for ChaCha8Rand {
+impl<const PARALLELISM: usize> RngCore for ChaCha8RandImplementation<PARALLELISM> {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         impls::fill_bytes_via_next(self, dest)
     }
@@ -124,22 +167,15 @@ impl RngCore for ChaCha8Rand {
     }
 
     fn next_u64(&mut self) -> u64 {
-        debug_assert!((0..=12).contains(&self.counter));
-        debug_assert!(self.counter % 4 == 0);
-        debug_assert!(self.end_index == 28 || self.end_index == 32);
-        debug_assert!((0..=self.end_index).contains(&self.index));
+        debug_assert!((0..=124).contains(&self.index));
 
-        if self.index == self.end_index {
+        if self.index == 124 {
             self.refill();
         }
 
         let result = self.buffer[self.index];
         self.index += 1;
         result
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        Ok(self.fill_bytes(dest))
     }
 }
 
@@ -148,17 +184,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
+    fn it_works_04() {
         let mut generator = ChaCha8Rand::from_seed(SEED);
-        for expected_value in EXPECTED_OUTPUT {
+        for expected_value in EXPECTED_OUTPUT_04 {
+            assert_eq!(generator.next_u64(), expected_value);
+        }
+    }
+
+    #[test]
+    fn it_works_08() {
+        let mut generator = ChaCha8Rand08::from_seed(SEED);
+        for expected_value in EXPECTED_OUTPUT_08 {
+            assert_eq!(generator.next_u64(), expected_value);
+        }
+    }
+
+    #[test]
+    fn it_works_16() {
+        let mut generator = ChaCha8Rand16::from_seed(SEED);
+        for expected_value in EXPECTED_OUTPUT_16 {
             assert_eq!(generator.next_u64(), expected_value);
         }
     }
 
     #[test]
     fn decode() {
-        let mut generator = ChaCha8Rand::decode(ENCODED_BYTES).unwrap();
-        for expected_value in EXPECTED_OUTPUT {
+        let mut generator = ChaCha8Rand::decode(&ENCODED_BYTES).unwrap();
+        for expected_value in EXPECTED_OUTPUT_04 {
             assert_eq!(generator.next_u64(), expected_value);
         }
     }
@@ -171,13 +223,13 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // Too slow.
     fn roundtrip() {
-        for i in 0..=EXPECTED_OUTPUT.len() {
+        for i in 0..=EXPECTED_OUTPUT_04.len() {
             let mut generator = ChaCha8Rand::from_seed(SEED);
-            for &expected_value in EXPECTED_OUTPUT[..i].into_iter() {
+            for &expected_value in EXPECTED_OUTPUT_04[..i].into_iter() {
                 assert_eq!(generator.next_u64(), expected_value);
             }
-            generator = ChaCha8Rand::decode(generator.encode()).unwrap();
-            for &expected_value in EXPECTED_OUTPUT[i..].into_iter() {
+            generator = ChaCha8Rand::decode(&generator.encode()).unwrap();
+            for &expected_value in EXPECTED_OUTPUT_04[i..].into_iter() {
                 assert_eq!(generator.next_u64(), expected_value);
             }
         }
@@ -192,7 +244,7 @@ mod tests {
         0x34, 0x35, 0x36,
     ];
 
-    const EXPECTED_OUTPUT: [u64; 372] = [
+    const EXPECTED_OUTPUT_04: [u64; 372] = [
         0xb773b6063d4616a5,
         0x1160af22a66abc3c,
         0x8c2599d9418d287c,
@@ -565,5 +617,755 @@ mod tests {
         0x02d97fd53ecc23c0,
         0xacaf05a34462374c,
         0xddd9c6d34bffa11f,
+    ];
+
+    const EXPECTED_OUTPUT_08: [u64; 372] = [
+        0xb773b6063d4616a5,
+        0x1160af22a66abc3c,
+        0xccf065f7190ff080,
+        0xfd76d1aa39673330,
+        0x8c2599d9418d287c,
+        0x7ee07e037edc5cd6,
+        0x95d232936cba6433,
+        0x6c7456d1070cbd17,
+        0xcfaa9ee02d1c16ad,
+        0x0e090eef8febea79,
+        0x462acfdaff8c6562,
+        0x5bafab866d34fc6a,
+        0x3c82d271128b5b3e,
+        0x9c5addc11252a34f,
+        0x0c862f78030a2988,
+        0xd39a83e407c3163d,
+        0xdf79bb617d6ceea6,
+        0x36d553591f9d736a,
+        0xc00a2b7b45f22ebf,
+        0x564307c62466b1a9,
+        0xeef0d14e181ee01f,
+        0x089bfc760ae58436,
+        0x257e0424b0c072d4,
+        0x6fb55e99496c28fe,
+        0xd9e52b59cc2ad268,
+        0xeb2fb4444b1b8aba,
+        0xae9873a88f5cd4e0,
+        0x4657362ac60d3773,
+        0x4f95c8a692c46661,
+        0xc3c6323217cae62c,
+        0x1c83f91ecdf23e8e,
+        0x6fdc0792c15387c0,
+        0x91ebb4367f4e2e7e,
+        0x784cf2c6a0ec9bc6,
+        0x36dad2a30dfd2b5c,
+        0xa4b593290595bdb7,
+        0x5c34ec5c34eabe20,
+        0x4f0a8f515570daa8,
+        0x4de18934e4cc02c5,
+        0xcdc0d604f015e3a7,
+        0xfc35dcb4113d6bf2,
+        0x5b0da44c645554bc,
+        0xfba0dbf69ad80321,
+        0x60e8bea3d139de87,
+        0x6d963da3db21d9e1,
+        0xeeaefc3150e500f3,
+        0xd18a4d851ef48756,
+        0x6366447c2215f34a,
+        0x2d37923dda3750a5,
+        0x380d7a626d4bc8b0,
+        0x05682e97d3d007ee,
+        0x4c0e8978c6d54ab2,
+        0xeeaf68ede3d7ee49,
+        0xf4356695883b717c,
+        0xcf1e9f6a6712edc2,
+        0x061439414c80cfd3,
+        0x846a9021392495a4,
+        0x8e8510549630a61b,
+        0xd1a8b6e2745c0ead,
+        0x31a7918d45c410e8,
+        0x18dc02545dbae493,
+        0x0f8f9ff0a65a3d43,
+        0xabcc61ad90216eec,
+        0x4040d92d2032a71a,
+        0x3cd2f66ffb40cd68,
+        0xdcd051c07295857a,
+        0x15cb30cecdd18eba,
+        0xcbc7fdecf6900274,
+        0xeab55cbcd9ab527e,
+        0x18471dce781bdaac,
+        0x3fb5c696dc8ba021,
+        0xd1664417c8d274e6,
+        0xf7f08cd144dc7252,
+        0x5804e0b13d7f40d1,
+        0x05f7e445ea457278,
+        0xf920bbca1b9db657,
+        0x5cb1a446e4b2d35b,
+        0xe6d4a728d2138a06,
+        0x0c1950b4da22cb99,
+        0xf875baf1af09e292,
+        0x05223e40ca60dad8,
+        0x2d61ec3206ac6a68,
+        0xbed3d7b84250f838,
+        0xf198e8080fd74160,
+        0xab692356874c17b8,
+        0xc30954417676de1c,
+        0xc9eda51d9b7ea703,
+        0xf709ef55439bf8f6,
+        0x4f1ace3732225624,
+        0xfba9510813988338,
+        0xd20c74feebf116fc,
+        0x305668eb146d7546,
+        0x997f200f52752e11,
+        0x1116aaafe86221fa,
+        0x829af3ec10d89787,
+        0x15b8f9697b551dbc,
+        0x07ce3b5cb2a13519,
+        0x2956bc72bc458314,
+        0xfc823c6c8e64b8c9,
+        0x345585e8183b40bc,
+        0x4188b7926140eb78,
+        0x56ca6dbfd4adea4d,
+        0x674b4171d6581368,
+        0x1234d81cd670e9f7,
+        0x7fe3c22349340ce5,
+        0x35c08f9c37675f8a,
+        0x0e505210d8a55e19,
+        0xe8258d69eeeca0dc,
+        0x11e1c7fbef5ed521,
+        0x98adc8464ec1bc75,
+        0x05d4c452e8baf67e,
+        0xe8dbe30116a45599,
+        0xd163b2c73d1203f8,
+        0x8c761ee043a2f3f3,
+        0x1cf08ce1b1176f00,
+        0xccf7d0a4b81ecb49,
+        0x24b99d6accecd7b7,
+        0x793e31aa112f0370,
+        0x303fea136b2c430e,
+        0x861d6c139c06c871,
+        0x8e87dc2a19285139,
+        0x4247ae04f7096e25,
+        0x4f346b48ac0e153e,
+        0x749a35cd52a86111,
+        0xb1cb3672f7a12fdd,
+        0xc957bf77b9b30b8f,
+        0x5e8107d80e743b2f,
+        0x3e4d10b6ea0d3cde,
+        0xd4684bd1b24dcd71,
+        0xa6ccbf33c3058b3f,
+        0x675d82e887bf57fe,
+        0x93a1c9b1bd84ad97,
+        0x52332713c175204a,
+        0x5c603a419a16fea0,
+        0x497b8609e32cf29c,
+        0xb27a66b3555501bf,
+        0xae85bd5702bd8fed,
+        0x443eaea0de938903,
+        0x23be23e55a862744,
+        0xd5e06b6c451ebcaf,
+        0x59f73550e769c495,
+        0x3d76dc421a93bc79,
+        0x1e8f2498298c3191,
+        0x5faa00b4ac7101fd,
+        0x24140fe5418416d4,
+        0x0264c96f87b9ef1e,
+        0x4fc926e9c990d0e0,
+        0xc0ac7d6c83bd8380,
+        0x3878be6af695f689,
+        0xbb5efa0c5f77624e,
+        0x8fe10ac00fd31cd0,
+        0x9a02cedbf3119afc,
+        0x95fed8cc907995c2,
+        0x704f1f7ca2d71896,
+        0xf7ba00de9e008cb1,
+        0x11ec727aa17427b0,
+        0x4212b648e70d0b14,
+        0xb7652cefbe262a08,
+        0x3de068ea72becf00,
+        0xf46320ac18e41490,
+        0x8cab5398492f9a09,
+        0x2ee8792d07f473dd,
+        0x0af74bf09a04450a,
+        0x0773e11ae4aa05c5,
+        0xc96c9c1a577a930c,
+        0xd32ee45bf88bda55,
+        0xff9a172515b253c6,
+        0xd119e0e00e76f023,
+        0xea0c5faffb02449b,
+        0x90c3ff659c12a558,
+        0x1f9b944fdde49e4f,
+        0xb965a550dc9c6021,
+        0x5240f3e58ff69721,
+        0x4956ac03fe15d462,
+        0xc3086fa68e7399f6,
+        0x90da0bc38a3dc91c,
+        0x61c647eb00d9db70,
+        0x0d27eda944b720e0,
+        0xfe8f27722e02130f,
+        0x7c5b5fe90523ff74,
+        0xf94b2a477dc5bc5c,
+        0xdf7e596af5e8e6e4,
+        0xe76c569a900c8161,
+        0x7d3401cbdc60462a,
+        0x43b5d91a14372d47,
+        0xd2e018675d907361,
+        0xa0ff417c32938f81,
+        0x71087ff1eac5661c,
+        0xb3278ecd4c3842f5,
+        0x5cc30c037c8511e6,
+        0xd5995e0a81207038,
+        0xb8a00cab72dbc9ec,
+        0x79f5039cad06c626,
+        0x51b9a42d394e71cf,
+        0xc1a75da13a13dbf6,
+        0x43d4c54683478f60,
+        0x80f936e8e6014b94,
+        0x46f7b69e56243334,
+        0xf3aa5c5cd6e82de8,
+        0xd9f5b2751f21d8d4,
+        0xbd00c290dd69026a,
+        0xc5671f386f0e6fb3,
+        0xa51abe2909b6975d,
+        0xee3ce607c808b695,
+        0xd57493886981159b,
+        0xf243173d9cfc5a24,
+        0x52714a10486b5783,
+        0xe885133f7dd1d95a,
+        0x89e2665f277addda,
+        0x025e294e3193bbbe,
+        0xca3887100cbfb4b4,
+        0x31d83f988c2902c1,
+        0x01a0c1dbb391b7f7,
+        0xdfbeb71f5287b4de,
+        0x594ff6ce899037cf,
+        0x5a5891b4ff2f77bc,
+        0x326ab918f4e118bb,
+        0x76065586c18559d9,
+        0x0d26700a995fd1c5,
+        0xc616ed67b73e4789,
+        0xec12af3e3ca4f551,
+        0x4d27732bfff0898c,
+        0xe88834b24c2aa216,
+        0x886e64d5c0e0ab8b,
+        0xc1dad9053e8c24aa,
+        0x3698dcda4c09c060,
+        0x0c7e870f4840d1b6,
+        0x809218a109592187,
+        0xa07775b9a5860f01,
+        0x9db6bd9718cf401d,
+        0x689f071905f11e8a,
+        0xde160860a52b46ce,
+        0x570714d63311c9c3,
+        0x54f2ccd8ed2fb110,
+        0x1256c9607cf5e1fe,
+        0x335b47e054e9089e,
+        0xcc68dccb1fbaeef5,
+        0x178212561214eb5e,
+        0xa6bd94d4fc9ccbb0,
+        0x5f214a9768e8a9df,
+        0x23050104be846686,
+        0x200a624255173670,
+        0x948b367d0329d5ef,
+        0x52a17a766930f718,
+        0x59d41cf010c80522,
+        0x3ad64fd523499906,
+        0x25993da512293b78,
+        0x649115a7e3797114,
+        0x8e1c5d88ac163b67,
+        0x68387067848fa5f0,
+        0xdd170ac881ef2381,
+        0x02812dd3ce2bccc3,
+        0xd92b45342e40fdae,
+        0xbbb97af0ffbbd59f,
+        0x113f17e854c53cb0,
+        0x23ed8f02e6d20adf,
+        0x726df69d3b40caae,
+        0x16af86967a2664a9,
+        0x2ec2f064d199acfb,
+        0xba881257c68a158c,
+        0x5f4c41ec63f3ca6b,
+        0x4ea3efa990fd9dbb,
+        0x5f38ad15460ddc9f,
+        0x2a64bc23700ed36c,
+        0xc47b2220d334cefa,
+        0x57ab28b6b89844cd,
+        0x5d69474b1941266c,
+        0x59ba23c65967c7a4,
+        0xb8bb44fae5c17eb7,
+        0xdb01ffaaafe3b255,
+        0x300f3529a390b05a,
+        0x402fc95d4b4f367a,
+        0x7a03725cd995a2df,
+        0x4dde5855bfb07448,
+        0xc49dd5e975f37ac9,
+        0xaecf02ae61301650,
+        0x51796f5346556625,
+        0x6eda66556968a505,
+        0xb81f44a1619f7174,
+        0x83e9b9a09e06fbd9,
+        0x5803cbf5d17d35b7,
+        0x2f2a4bd269586f7c,
+        0x515555c7f55d47f4,
+        0x3e0964889a195dc5,
+        0xe6266eadd2f2ef1d,
+        0x8c2c3f0717cb0f60,
+        0xfe6f3364bc6b35c6,
+        0x38083a973c32e758,
+        0x560807c4189397b4,
+        0x9b8e2c7f894d68e1,
+        0x013084796e79285e,
+        0xb5825f39dddfded6,
+        0xcb97f6147d2b9147,
+        0x5d4cfa2b1014122a,
+        0x49de893b4b8b9cf6,
+        0x2fcbf131dd390914,
+        0x193c6c0e7ee27483,
+        0xf5022ecbcb3a1395,
+        0xf999af647acc7440,
+        0xba9aa83dd1fff911,
+        0xdf651c84e97f3f18,
+        0xf087379387d6a138,
+        0xcb868c79c530602b,
+        0x53316029b1d373df,
+        0x9b22dcbff38a358c,
+        0xc2854530bdabb4a2,
+        0x232348edc17eba5c,
+        0x44c2f7aea45a0648,
+        0xefd98d4a6325a84a,
+        0x1648b418fa3e97cc,
+        0x8fc98ffacce3a37f,
+        0x8e062ad0fb05c1d0,
+        0x7e4673a87456c0c7,
+        0x009a0c4bba9c38e8,
+        0x914bd0b036050636,
+        0x77ce58fc68887f6b,
+        0xe932d0f5342a52c4,
+        0x0b480d9f46cf5be7,
+        0x8d2839f06be0f63a,
+        0x8d5225243bbfd044,
+        0x4e1ba86d01011aba,
+        0x1fa1219100162b8a,
+        0x75825796f78b111f,
+        0x1dcd961c2bb11d4a,
+        0x7334b276ed2b05eb,
+        0x6c79231cb8bc979d,
+        0x81ae87a7dc51070c,
+        0x15221a7643356142,
+        0x20cf95cd85c458ca,
+        0xa43063b912c5c6e3,
+        0x9d35d692e0ebb2c8,
+        0xc061c89457bd3545,
+        0x3275bd4f89d41d2d,
+        0x360186b0c2f44b64,
+        0xe202ef6203f16292,
+        0x74c00486e46afffe,
+        0xa0e70f95a4e5ede1,
+        0x75424460dd1399b3,
+        0xd1ad4aed2c620c1c,
+        0x8e9af0e781daece8,
+        0xb675aa39daef9017,
+        0x4f38b121b4b7544c,
+        0xbe5dc6d9b25a02bb,
+        0xef299613e8573ea7,
+        0x2d7ff4439179589c,
+        0xd538b93bf65a2d0b,
+        0xdcba077d244fc74c,
+        0x9727715549a3e0a4,
+        0x963d1f4e55f39804,
+        0xb156c889a5892b2a,
+        0x780e8257c95d9e25,
+        0xb92fabc4debeccb5,
+        0x0f2a5da003c53183,
+        0x7df8ed6c6780cae1,
+        0x343a1b6566ae6486,
+        0xd13cdab29e357728,
+        0xcd0efd3aa1d0b160,
+        0x76d935bb22a8cfe0,
+        0x501677c9b0bb735a,
+        0xd4cfd43af96c9d49,
+        0xc51f1269e513b4e6,
+        0x4e216f5b4235cb34,
+        0x757df7685596bec0,
+        0x2be4cced117be064,
+        0x7c31e805e92b7981,
+        0x487c8e333e0eee9e,
+        0x9f8b02b2cba68ee2,
+        0xb69c9957d6364ed0,
+        0x1722a1ef35feee9c,
+        0xa77a453bc9dd475a,
+        0x142ef0793b9e8925,
+        0x8035d586d818cdfb,
+    ];
+
+    const EXPECTED_OUTPUT_16: [u64; 372] = [
+        0xb773b6063d4616a5,
+        0x1160af22a66abc3c,
+        0xccf065f7190ff080,
+        0xfd76d1aa39673330,
+        0x3cd2f66ffb40cd68,
+        0xdcd051c07295857a,
+        0x15cb30cecdd18eba,
+        0xcbc7fdecf6900274,
+        0x8c2599d9418d287c,
+        0x7ee07e037edc5cd6,
+        0x95d232936cba6433,
+        0x6c7456d1070cbd17,
+        0xeab55cbcd9ab527e,
+        0x18471dce781bdaac,
+        0x3fb5c696dc8ba021,
+        0xd1664417c8d274e6,
+        0xcfaa9ee02d1c16ad,
+        0x0e090eef8febea79,
+        0x462acfdaff8c6562,
+        0x5bafab866d34fc6a,
+        0xf7f08cd144dc7252,
+        0x5804e0b13d7f40d1,
+        0x05f7e445ea457278,
+        0xf920bbca1b9db657,
+        0x3c82d271128b5b3e,
+        0x9c5addc11252a34f,
+        0x0c862f78030a2988,
+        0xd39a83e407c3163d,
+        0x5cb1a446e4b2d35b,
+        0xe6d4a728d2138a06,
+        0x0c1950b4da22cb99,
+        0xf875baf1af09e292,
+        0xdf79bb617d6ceea6,
+        0x36d553591f9d736a,
+        0xc00a2b7b45f22ebf,
+        0x564307c62466b1a9,
+        0x05223e40ca60dad8,
+        0x2d61ec3206ac6a68,
+        0xbed3d7b84250f838,
+        0xf198e8080fd74160,
+        0xeef0d14e181ee01f,
+        0x089bfc760ae58436,
+        0x257e0424b0c072d4,
+        0x6fb55e99496c28fe,
+        0xab692356874c17b8,
+        0xc30954417676de1c,
+        0xc9eda51d9b7ea703,
+        0xf709ef55439bf8f6,
+        0xd9e52b59cc2ad268,
+        0xeb2fb4444b1b8aba,
+        0xae9873a88f5cd4e0,
+        0x4657362ac60d3773,
+        0x4f1ace3732225624,
+        0xfba9510813988338,
+        0xd20c74feebf116fc,
+        0x305668eb146d7546,
+        0x4f95c8a692c46661,
+        0xc3c6323217cae62c,
+        0x1c83f91ecdf23e8e,
+        0x6fdc0792c15387c0,
+        0x997f200f52752e11,
+        0x1116aaafe86221fa,
+        0x829af3ec10d89787,
+        0x15b8f9697b551dbc,
+        0x91ebb4367f4e2e7e,
+        0x784cf2c6a0ec9bc6,
+        0x36dad2a30dfd2b5c,
+        0xa4b593290595bdb7,
+        0x07ce3b5cb2a13519,
+        0x2956bc72bc458314,
+        0xfc823c6c8e64b8c9,
+        0x345585e8183b40bc,
+        0x5c34ec5c34eabe20,
+        0x4f0a8f515570daa8,
+        0x4de18934e4cc02c5,
+        0xcdc0d604f015e3a7,
+        0x4188b7926140eb78,
+        0x56ca6dbfd4adea4d,
+        0x674b4171d6581368,
+        0x1234d81cd670e9f7,
+        0xfc35dcb4113d6bf2,
+        0x5b0da44c645554bc,
+        0xfba0dbf69ad80321,
+        0x60e8bea3d139de87,
+        0x7fe3c22349340ce5,
+        0x35c08f9c37675f8a,
+        0x0e505210d8a55e19,
+        0xe8258d69eeeca0dc,
+        0x6d963da3db21d9e1,
+        0xeeaefc3150e500f3,
+        0xd18a4d851ef48756,
+        0x6366447c2215f34a,
+        0x11e1c7fbef5ed521,
+        0x98adc8464ec1bc75,
+        0x05d4c452e8baf67e,
+        0xe8dbe30116a45599,
+        0x2d37923dda3750a5,
+        0x380d7a626d4bc8b0,
+        0x05682e97d3d007ee,
+        0x4c0e8978c6d54ab2,
+        0xd163b2c73d1203f8,
+        0x8c761ee043a2f3f3,
+        0x1cf08ce1b1176f00,
+        0xccf7d0a4b81ecb49,
+        0xeeaf68ede3d7ee49,
+        0xf4356695883b717c,
+        0xcf1e9f6a6712edc2,
+        0x061439414c80cfd3,
+        0x24b99d6accecd7b7,
+        0x793e31aa112f0370,
+        0x303fea136b2c430e,
+        0x861d6c139c06c871,
+        0x846a9021392495a4,
+        0x8e8510549630a61b,
+        0xd1a8b6e2745c0ead,
+        0x31a7918d45c410e8,
+        0x8e87dc2a19285139,
+        0x4247ae04f7096e25,
+        0x4f346b48ac0e153e,
+        0x749a35cd52a86111,
+        0x18dc02545dbae493,
+        0x0f8f9ff0a65a3d43,
+        0xabcc61ad90216eec,
+        0x4040d92d2032a71a,
+        0xb1cb3672f7a12fdd,
+        0xc957bf77b9b30b8f,
+        0x5e8107d80e743b2f,
+        0x3e4d10b6ea0d3cde,
+        0xb3278ecd4c3842f5,
+        0x5cc30c037c8511e6,
+        0xd5995e0a81207038,
+        0xb8a00cab72dbc9ec,
+        0xd4684bd1b24dcd71,
+        0xa6ccbf33c3058b3f,
+        0x675d82e887bf57fe,
+        0x93a1c9b1bd84ad97,
+        0x79f5039cad06c626,
+        0x51b9a42d394e71cf,
+        0xc1a75da13a13dbf6,
+        0x43d4c54683478f60,
+        0x52332713c175204a,
+        0x5c603a419a16fea0,
+        0x497b8609e32cf29c,
+        0xb27a66b3555501bf,
+        0x80f936e8e6014b94,
+        0x46f7b69e56243334,
+        0xf3aa5c5cd6e82de8,
+        0xd9f5b2751f21d8d4,
+        0xae85bd5702bd8fed,
+        0x443eaea0de938903,
+        0x23be23e55a862744,
+        0xd5e06b6c451ebcaf,
+        0xbd00c290dd69026a,
+        0xc5671f386f0e6fb3,
+        0xa51abe2909b6975d,
+        0xee3ce607c808b695,
+        0x59f73550e769c495,
+        0x3d76dc421a93bc79,
+        0x1e8f2498298c3191,
+        0x5faa00b4ac7101fd,
+        0xd57493886981159b,
+        0xf243173d9cfc5a24,
+        0x52714a10486b5783,
+        0xe885133f7dd1d95a,
+        0x24140fe5418416d4,
+        0x0264c96f87b9ef1e,
+        0x4fc926e9c990d0e0,
+        0xc0ac7d6c83bd8380,
+        0x89e2665f277addda,
+        0x025e294e3193bbbe,
+        0xca3887100cbfb4b4,
+        0x31d83f988c2902c1,
+        0x3878be6af695f689,
+        0xbb5efa0c5f77624e,
+        0x8fe10ac00fd31cd0,
+        0x9a02cedbf3119afc,
+        0x01a0c1dbb391b7f7,
+        0xdfbeb71f5287b4de,
+        0x594ff6ce899037cf,
+        0x5a5891b4ff2f77bc,
+        0x95fed8cc907995c2,
+        0x704f1f7ca2d71896,
+        0xf7ba00de9e008cb1,
+        0x11ec727aa17427b0,
+        0x326ab918f4e118bb,
+        0x76065586c18559d9,
+        0x0d26700a995fd1c5,
+        0xc616ed67b73e4789,
+        0x4212b648e70d0b14,
+        0xb7652cefbe262a08,
+        0x3de068ea72becf00,
+        0xf46320ac18e41490,
+        0xec12af3e3ca4f551,
+        0x4d27732bfff0898c,
+        0xe88834b24c2aa216,
+        0x886e64d5c0e0ab8b,
+        0x8cab5398492f9a09,
+        0x2ee8792d07f473dd,
+        0x0af74bf09a04450a,
+        0x0773e11ae4aa05c5,
+        0xc1dad9053e8c24aa,
+        0x3698dcda4c09c060,
+        0x0c7e870f4840d1b6,
+        0x809218a109592187,
+        0xc96c9c1a577a930c,
+        0xd32ee45bf88bda55,
+        0xff9a172515b253c6,
+        0xd119e0e00e76f023,
+        0xa07775b9a5860f01,
+        0x9db6bd9718cf401d,
+        0x689f071905f11e8a,
+        0xde160860a52b46ce,
+        0xea0c5faffb02449b,
+        0x90c3ff659c12a558,
+        0x1f9b944fdde49e4f,
+        0xb965a550dc9c6021,
+        0x570714d63311c9c3,
+        0x54f2ccd8ed2fb110,
+        0x1256c9607cf5e1fe,
+        0x335b47e054e9089e,
+        0x5240f3e58ff69721,
+        0x4956ac03fe15d462,
+        0xc3086fa68e7399f6,
+        0x90da0bc38a3dc91c,
+        0xcc68dccb1fbaeef5,
+        0x178212561214eb5e,
+        0xa6bd94d4fc9ccbb0,
+        0x5f214a9768e8a9df,
+        0x61c647eb00d9db70,
+        0x0d27eda944b720e0,
+        0xfe8f27722e02130f,
+        0x7c5b5fe90523ff74,
+        0x23050104be846686,
+        0x200a624255173670,
+        0x948b367d0329d5ef,
+        0x52a17a766930f718,
+        0xf94b2a477dc5bc5c,
+        0xdf7e596af5e8e6e4,
+        0xe76c569a900c8161,
+        0x7d3401cbdc60462a,
+        0x59d41cf010c80522,
+        0x3ad64fd523499906,
+        0x25993da512293b78,
+        0x649115a7e3797114,
+        0x43b5d91a14372d47,
+        0xd2e018675d907361,
+        0xa0ff417c32938f81,
+        0x71087ff1eac5661c,
+        0x8e1c5d88ac163b67,
+        0x68387067848fa5f0,
+        0xdd170ac881ef2381,
+        0x02812dd3ce2bccc3,
+        0x7e4673a87456c0c7,
+        0x009a0c4bba9c38e8,
+        0x914bd0b036050636,
+        0x77ce58fc68887f6b,
+        0xd92b45342e40fdae,
+        0xbbb97af0ffbbd59f,
+        0x113f17e854c53cb0,
+        0x23ed8f02e6d20adf,
+        0xe932d0f5342a52c4,
+        0x0b480d9f46cf5be7,
+        0x8d2839f06be0f63a,
+        0x8d5225243bbfd044,
+        0x726df69d3b40caae,
+        0x16af86967a2664a9,
+        0x2ec2f064d199acfb,
+        0xba881257c68a158c,
+        0x4e1ba86d01011aba,
+        0x1fa1219100162b8a,
+        0x75825796f78b111f,
+        0x1dcd961c2bb11d4a,
+        0x5f4c41ec63f3ca6b,
+        0x4ea3efa990fd9dbb,
+        0x5f38ad15460ddc9f,
+        0x2a64bc23700ed36c,
+        0x7334b276ed2b05eb,
+        0x6c79231cb8bc979d,
+        0x81ae87a7dc51070c,
+        0x15221a7643356142,
+        0xc47b2220d334cefa,
+        0x57ab28b6b89844cd,
+        0x5d69474b1941266c,
+        0x59ba23c65967c7a4,
+        0x20cf95cd85c458ca,
+        0xa43063b912c5c6e3,
+        0x9d35d692e0ebb2c8,
+        0xc061c89457bd3545,
+        0xb8bb44fae5c17eb7,
+        0xdb01ffaaafe3b255,
+        0x300f3529a390b05a,
+        0x402fc95d4b4f367a,
+        0x3275bd4f89d41d2d,
+        0x360186b0c2f44b64,
+        0xe202ef6203f16292,
+        0x74c00486e46afffe,
+        0x7a03725cd995a2df,
+        0x4dde5855bfb07448,
+        0xc49dd5e975f37ac9,
+        0xaecf02ae61301650,
+        0xa0e70f95a4e5ede1,
+        0x75424460dd1399b3,
+        0xd1ad4aed2c620c1c,
+        0x8e9af0e781daece8,
+        0x51796f5346556625,
+        0x6eda66556968a505,
+        0xb81f44a1619f7174,
+        0x83e9b9a09e06fbd9,
+        0xb675aa39daef9017,
+        0x4f38b121b4b7544c,
+        0xbe5dc6d9b25a02bb,
+        0xef299613e8573ea7,
+        0x5803cbf5d17d35b7,
+        0x2f2a4bd269586f7c,
+        0x515555c7f55d47f4,
+        0x3e0964889a195dc5,
+        0x2d7ff4439179589c,
+        0xd538b93bf65a2d0b,
+        0xdcba077d244fc74c,
+        0x9727715549a3e0a4,
+        0xe6266eadd2f2ef1d,
+        0x8c2c3f0717cb0f60,
+        0xfe6f3364bc6b35c6,
+        0x38083a973c32e758,
+        0x963d1f4e55f39804,
+        0xb156c889a5892b2a,
+        0x780e8257c95d9e25,
+        0xb92fabc4debeccb5,
+        0x560807c4189397b4,
+        0x9b8e2c7f894d68e1,
+        0x013084796e79285e,
+        0xb5825f39dddfded6,
+        0x0f2a5da003c53183,
+        0x7df8ed6c6780cae1,
+        0x343a1b6566ae6486,
+        0xd13cdab29e357728,
+        0xcb97f6147d2b9147,
+        0x5d4cfa2b1014122a,
+        0x49de893b4b8b9cf6,
+        0x2fcbf131dd390914,
+        0xcd0efd3aa1d0b160,
+        0x76d935bb22a8cfe0,
+        0x501677c9b0bb735a,
+        0xd4cfd43af96c9d49,
+        0x193c6c0e7ee27483,
+        0xf5022ecbcb3a1395,
+        0xf999af647acc7440,
+        0xba9aa83dd1fff911,
+        0xc51f1269e513b4e6,
+        0x4e216f5b4235cb34,
+        0x757df7685596bec0,
+        0x2be4cced117be064,
+        0xdf651c84e97f3f18,
+        0xf087379387d6a138,
+        0xcb868c79c530602b,
+        0x53316029b1d373df,
+        0x7c31e805e92b7981,
+        0x487c8e333e0eee9e,
+        0x9f8b02b2cba68ee2,
+        0xb69c9957d6364ed0,
+        0x9b22dcbff38a358c,
+        0xc2854530bdabb4a2,
+        0x232348edc17eba5c,
+        0x44c2f7aea45a0648,
+        0x1722a1ef35feee9c,
+        0xa77a453bc9dd475a,
+        0x142ef0793b9e8925,
+        0x8035d586d818cdfb,
+        0xefd98d4a6325a84a,
+        0x1648b418fa3e97cc,
+        0x8fc98ffacce3a37f,
+        0x8e062ad0fb05c1d0,
     ];
 }
