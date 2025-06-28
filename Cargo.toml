@@ -1,11 +1,10 @@
 [package]
-authors = ["nixberg"]
-description = "ChaCha8Rand is a fast ChaCha8-based key-erasure CSPRNG"
-edition = "2024"
-license = "MIT"
 name = "chacha8rand"
-repository = "https://github.com/nixberg/chacha8rand-rs"
 version = "0.1.0"
+edition = "2024"
+description = "ChaCha8Rand is a fast ChaCha8-based key-erasure CSPRNG"
+repository = "https://github.com/nixberg/chacha8rand-rs"
+license = "MIT"
 
 [dependencies]
 rand_core = "0.9"
