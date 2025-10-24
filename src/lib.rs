@@ -1,4 +1,3 @@
-#![feature(array_chunks)]
 #![feature(portable_simd)]
 
 use core::simd::u32x4;
@@ -122,8 +121,11 @@ fn copy_from_state<const OFFSET: usize, const COUNT: usize>(
     source: &[u32x4; 16],
     destination: &mut [u32; COUNT],
 ) {
+    debug_assert!(COUNT.is_multiple_of(4));
     for (lhs, rhs) in destination
-        .array_chunks_mut::<4>()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
         .zip(source.iter().skip(OFFSET))
     {
         lhs.copy_from_slice(rhs.as_array());
@@ -171,16 +173,22 @@ mod tests {
     #[test]
     fn it_works_u32() {
         let mut generator = ChaCha8Rand::from_seed(SEED);
-        for chunk in EXPECTED_OUTPUT.array_chunks::<4>() {
-            assert_eq!(generator.next_u32(), u32::from_le_bytes(*chunk));
+        for chunk in EXPECTED_OUTPUT.chunks(4) {
+            assert_eq!(
+                generator.next_u32(),
+                u32::from_le_bytes(chunk.try_into().unwrap())
+            );
         }
     }
 
     #[test]
     fn it_works_u64() {
         let mut generator = ChaCha8Rand::from_seed(SEED);
-        for chunk in EXPECTED_OUTPUT.array_chunks::<8>() {
-            assert_eq!(generator.next_u64(), u64::from_le_bytes(*chunk));
+        for chunk in EXPECTED_OUTPUT.chunks(8) {
+            assert_eq!(
+                generator.next_u64(),
+                u64::from_le_bytes(chunk.try_into().unwrap())
+            );
         }
     }
 
