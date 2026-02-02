@@ -1,6 +1,3 @@
-[![Rust](https://github.com/nixberg/chacha8rand-rs/actions/workflows/rust.yaml/badge.svg)](
-https://github.com/nixberg/chacha8rand-rs/actions/workflows/rust.yaml)
-
 # chacha8rand-rs
 
 ChaCha8Rand is a ChaCha8-based key-erasure CSPRNG with performance similar to non-cryptographic
