@@ -1,22 +1,53 @@
 #![feature(portable_simd)]
 
 use core::simd::u32x4;
+use std::convert::Infallible;
 
-use rand_core::SeedableRng;
-use rand_core::block::{BlockRng, BlockRngCore};
+use rand_core::block::{BlockRng, Generator};
+use rand_core::{SeedableRng, TryCryptoRng, TryRng};
 
-pub type ChaCha8Rand = BlockRng<ChaCha8RandCore>;
+pub struct ChaCha8Rand(BlockRng<ChaCha8RandGenerator>);
 
-pub struct ChaCha8RandCore {
+impl SeedableRng for ChaCha8Rand {
+    type Seed = [u8; 32];
+
+    fn from_seed(seed: Self::Seed) -> Self {
+        Self(BlockRng::new(ChaCha8RandGenerator {
+            seed: rand_core::utils::read_words(&seed),
+        }))
+    }
+}
+
+impl TryCryptoRng for ChaCha8Rand {}
+
+impl TryRng for ChaCha8Rand {
+    type Error = Infallible;
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        Ok(self.0.fill_bytes(dst))
+    }
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.0.next_word())
+    }
+
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.next_u64_from_u32())
+    }
+}
+
+struct ChaCha8RandGenerator {
     seed: [u32; 8],
 }
 
-impl BlockRngCore for ChaCha8RandCore {
-    type Item = u32;
-    type Results = Buffer; // Workaround until [u32; 248] implements Default.
+impl Generator for ChaCha8RandGenerator {
+    type Output = [u32; 248];
 
-    fn generate(&mut self, results: &mut Self::Results) {
-        let (chunks, last_chunk) = results.0.as_chunks_mut::<64>();
+    fn generate(&mut self, output: &mut Self::Output) {
+        let (chunks, last_chunk) = output.as_chunks_mut::<64>();
 
         let state = expand_seed::<00>(&self.seed);
         copy_from_state::<00, 64>(&state, &mut chunks[0]);
@@ -30,46 +61,6 @@ impl BlockRngCore for ChaCha8RandCore {
         let state = expand_seed::<12>(&self.seed);
         copy_from_state::<00, 56>(&state, last_chunk.try_into().unwrap());
         copy_from_state::<14, 08>(&state, &mut self.seed);
-    }
-}
-
-impl SeedableRng for ChaCha8RandCore {
-    type Seed = [u8; 32];
-
-    fn from_seed(seed: Self::Seed) -> Self {
-        let chunks: &[_; 8] = seed.as_chunks::<4>().0.try_into().unwrap();
-        Self {
-            seed: [
-                u32::from_le_bytes(chunks[0]),
-                u32::from_le_bytes(chunks[1]),
-                u32::from_le_bytes(chunks[2]),
-                u32::from_le_bytes(chunks[3]),
-                u32::from_le_bytes(chunks[4]),
-                u32::from_le_bytes(chunks[5]),
-                u32::from_le_bytes(chunks[6]),
-                u32::from_le_bytes(chunks[7]),
-            ],
-        }
-    }
-}
-
-pub struct Buffer([u32; 248]);
-
-impl AsRef<[u32]> for Buffer {
-    fn as_ref(&self) -> &[u32] {
-        self.0.as_ref()
-    }
-}
-
-impl AsMut<[u32]> for Buffer {
-    fn as_mut(&mut self) -> &mut [u32] {
-        self.0.as_mut()
-    }
-}
-
-impl Default for Buffer {
-    fn default() -> Self {
-        Self([0; 248])
     }
 }
 
@@ -158,7 +149,7 @@ fn rotate_left<const OFFSET: u32>(x: u32x4) -> u32x4 {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::{RngCore, SeedableRng};
+    use rand_core::{Rng, SeedableRng};
 
     use super::ChaCha8Rand;
 
